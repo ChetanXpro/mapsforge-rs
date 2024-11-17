@@ -51,12 +51,12 @@ pub struct MapHeader {
 
 
 
-#[derive(Debug)]
-pub struct TileIndexHeader {
-    pub debug_signature: Option<String>,
-}
+// #[derive(Debug)]
+// pub struct TileIndexHeader {
+//     pub debug_signature: Option<String>,
+// }
 
-#[derive(Debug)]
+#[derive(Debug,Clone, Copy)]
 pub struct TileIndexEntry {
     pub is_water: bool,   
     pub offset: u64,         
@@ -71,26 +71,23 @@ pub struct MapFile {
 
 #[derive(Debug)]
 pub struct Tile {
- 
-    pub debug_signature: Option<String>,
-    
 
     pub zoom_table: Vec<(u32, u32)>, 
     pub first_way_offset: u32,
     
   
     pub pois: Vec<POI>,
-    pub ways: Vec<Way>
+    // pub ways: Vec<Way>
 }
 
 #[derive(Debug)]
 pub struct POI {
 
-    pub debug_signature: Option<String>,
+  
     
-    pub position_offset: (i32, i32),
+    pub position_offset: (f64, f64),
     pub layer: i8,
-    pub tag_ids: Vec<u32>,
+    pub tag: Vec<String>,
     pub name: Option<String>,
     pub house_number: Option<String>, 
     pub elevation: Option<i32>
@@ -98,7 +95,6 @@ pub struct POI {
 #[derive(Debug)]
 pub struct Way {
 
-    pub debug_signature: Option<String>,
     
     pub sub_tile_bitmap: u16, 
     pub layer: i8, 

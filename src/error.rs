@@ -19,5 +19,18 @@ pub enum MapforgeError {
     InvalidHeaderSize(u32),
 
     #[error("Invalid tile index signature")]
-    InvalidIndexSignature,
+    InvalidTileIndexSignature,
+
+    #[error("Invalid tile signature")]
+    InvalidTileSignature,
+
+    #[error("Invalid tile POI signature")]
+    InvalidTilePOISignature,
+
+    #[error("Tile out of bound")]
+    TileOutOfBounds,
+
+
+    #[error("Errrrrr")]
+    InvalidVBEInteger
 }

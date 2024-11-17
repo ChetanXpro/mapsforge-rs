@@ -232,6 +232,56 @@ impl MapHeader {
         Ok(String::from_utf8(string_bytes).expect("Error parsing vbe_u"))
     }
 
+    pub(crate) fn read_vbe_u_int<R: Read>(reader: &mut BufReader<R>) -> Result<u32> {
+
+        let mut value = 0u32;
+
+        let mut shift = 0;
+
+        loop {
+            let byte = reader.read_u8()?;
+
+            value |= ((byte & 0x7F) as u32) << shift;
+
+            if byte & 0x80 == 0 {
+                break;
+            }
+
+            shift += 7
+        }
+        
+
+        Ok(value)
+
+     }
+
+     pub fn read_vbe_s_int<R: Read>(reader: &mut BufReader<R>) -> Result<i32> {
+        let mut value = 0i32;
+        let mut shift = 0;
+    
+        // Read bytes until we find one with continuation bit = 0
+        loop {
+            let byte = reader.read_u8()?;
+            
+            // Last byte
+            if byte & 0x80 == 0 {
+                // Last byte uses 6 bits for data and 1 bit for sign
+                let is_negative = (byte & 0x40) != 0;
+                value |= ((byte & 0x3f) as i32) << shift;
+                
+                if is_negative {
+                    value = -value;
+                }
+                break;
+            }
+    
+            // Use 7 bits from continuation bytes
+            value |= ((byte & 0x7f) as i32) << shift;
+            shift += 7;
+        }
+    
+        Ok(value)
+    }
     pub fn is_valid(&self) -> bool {
         self.magic.trim() == MAGIC_BYTES
             && self.header_size > 0
