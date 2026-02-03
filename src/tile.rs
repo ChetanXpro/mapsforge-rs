@@ -5,12 +5,12 @@ use std::{
     path::Path,
 };
 
-use byteorder::ReadBytesExt;
+use byteorder::{BigEndian, ReadBytesExt};
 
 use crate::{
     error::MapforgeError,
     header::DEBUG_INFO_MASK,
-    types::{BoundingBox, MapFile, MapHeader, Tile, TileIndexEntry, POI},
+    types::{BoundingBox, MapFile, MapHeader, Tile, TileIndexEntry, Way, WayCoordinateBlock, POI},
     Result,
 };
 
@@ -74,148 +74,387 @@ impl MapFile {
     }
 
     pub fn get_tile_at(&mut self, lat: f64, lon: f64, zoom: u8) -> Result<Tile> {
-        let tile_entry = self.calculate_tile_entry(lat, lon, zoom)?.offset;
-
-        self.reader.seek(SeekFrom::Start(tile_entry))?;
-
-        // TILE HEADER READING
-        if self.header.flags & DEBUG_INFO_MASK != 0 {
-            let mut bytes = [0u8; 32];
-            self.reader.read_exact(&mut bytes)?;
-
-            let sig = String::from_utf8_lossy(&bytes).trim().to_string();
-
-            if sig != TILE_SIGNATURE {
-                return Err(MapforgeError::InvalidTileSignature);
-            }
-        }
-
         let zoom_level_index = self
             .header
             .zoom_interval_configuration
             .iter()
             .position(|interval| zoom >= interval.min_zoom_level && zoom <= interval.max_zoom_level)
-            .unwrap();
+            .ok_or(MapforgeError::ZoomLevelNotSupported)?;
 
-        let zoom_interval = &self.header.zoom_interval_configuration[zoom_level_index];
-        let num_zoom_levels = zoom_interval.max_zoom_level - zoom_interval.min_zoom_level + 1;
+        let zoom_interval_start =
+            self.header.zoom_interval_configuration[zoom_level_index].sub_file_start;
+        let min_zoom = self.header.zoom_interval_configuration[zoom_level_index].min_zoom_level;
+        let max_zoom = self.header.zoom_interval_configuration[zoom_level_index].max_zoom_level;
 
-        let mut raw_numbers = Vec::new();
+        let tile_index_entry = self.calculate_tile_entry(lat, lon, zoom)?;
+        let tile_offset = tile_index_entry.offset;
 
-        for _ in 0..(num_zoom_levels * 2) {
-            let value = MapHeader::read_vbe_u_int(&mut self.reader)?;
+        let absolute_offset = zoom_interval_start + tile_offset;
 
-            raw_numbers.push(value);
+      
+        self.reader.seek(SeekFrom::Start(absolute_offset))?;
+
+        // TILE HEADER - Debug signature
+        if self.header.flags & DEBUG_INFO_MASK != 0 {
+            let mut bytes = [0u8; 32];
+            self.reader.read_exact(&mut bytes)?;
+            let sig = String::from_utf8_lossy(&bytes);
+            println!("DEBUG: tile signature = '{}'", sig.trim());
+
+            if !sig.starts_with("###TileStart") {
+                return Err(MapforgeError::InvalidTileSignature);
+            }
         }
 
-        let zoom_table: Vec<(u32, u32)> = raw_numbers
-            .chunks(2)
-            .map(|chunk| (chunk[0], chunk[1]))
-            .collect();
+        // Zoom table
+        let num_zoom_levels = max_zoom - min_zoom + 1;
 
-        let mut bytes = [0u8; 4];
-        self.reader.read_exact(&mut bytes)?;
-        let first_way_offset = u32::from_be_bytes(bytes);
+        let mut zoom_table: Vec<(u32, u32)> = Vec::with_capacity(num_zoom_levels as usize);
+        for _ in 0..num_zoom_levels {
+            let poi_count = MapHeader::read_vbe_u_int(&mut self.reader)?;
+            let way_count = MapHeader::read_vbe_u_int(&mut self.reader)?;
+            zoom_table.push((poi_count, way_count));
+        }
 
-        let current_zoom_index = zoom - zoom_interval.min_zoom_level;
+        println!("DEBUG: zoom_table = {:?}", zoom_table);
 
-        let mut poi_data: Vec<POI> = vec![];
+        // Save position BEFORE reading first_way_offset
+        let first_way_offset_position = self.reader.stream_position()?;
 
-        println!("POI EXIST: {}",zoom_table[current_zoom_index as usize].0);
+        // First way offset (VBE-U INT)
+        let first_way_offset = MapHeader::read_vbe_u_int(&mut self.reader)?;
+        println!("DEBUG: first_way_offset = {}", first_way_offset);
+        println!(
+            "DEBUG: first_way_offset_position = {}",
+            first_way_offset_position
+        );
 
-        // POI READING
-        for _ in 0..zoom_table[current_zoom_index as usize].0 {
+        // Position right after first_way_offset is read
+        let after_first_way_offset = self.reader.stream_position()?;
+
+        // Calculate where ways actually start
+        // first_way_offset is counted from the byte AFTER the first_way_offset field
+        let ways_absolute_position = after_first_way_offset + first_way_offset as u64;
+        println!("DEBUG: ways_absolute_position = {}", ways_absolute_position);
+
+        let current_zoom_index = (zoom - min_zoom) as usize;
+        let poi_count = zoom_table[current_zoom_index].0;
+
+        println!("DEBUG: current_zoom_index = {}", current_zoom_index);
+        println!("DEBUG: poi_count for this zoom = {}", poi_count);
+
+        if poi_count > 50000 {
+            println!("ERROR: POI count {} is suspiciously high", poi_count);
+            return Err(MapforgeError::InvalidTileData);
+        }
+
+        let poi_tags_len = self.header.poi_tags.len();
+        let mut poi_data: Vec<POI> = Vec::with_capacity(poi_count as usize);
+
+        // POI READING (we're already at the right position - right after first_way_offset)
+        for i in 0..poi_count {
             if self.header.flags & DEBUG_INFO_MASK != 0 {
                 let mut bytes = [0u8; 32];
                 self.reader.read_exact(&mut bytes)?;
+                let sig = String::from_utf8_lossy(&bytes);
 
-                let sig = String::from_utf8_lossy(&bytes).trim().to_string();
-
-                if sig != POI_SIGNATURE {
+                if !sig.starts_with("***POIStart") {
+                    println!(
+                        "ERROR: Invalid POI signature at index {}: '{}'",
+                        i,
+                        sig.trim()
+                    );
                     return Err(MapforgeError::InvalidTilePOISignature);
                 }
             }
 
-            let lat = MapHeader::read_vbe_s_int(&mut self.reader)? as f64 / 1_000_000.0;
-            let lon = MapHeader::read_vbe_s_int(&mut self.reader)? as f64 / 1_000_000.0;
+            let lat_diff = MapHeader::read_vbe_s_int(&mut self.reader)?;
+            let lon_diff = MapHeader::read_vbe_s_int(&mut self.reader)?;
 
-            // special byte
+            let special_byte = self.reader.read_u8()?;
+            let layer = (((special_byte & 0xf0) >> 4) as i8) - 5;
+            let num_tags = (special_byte & 0x0f) as u32;
 
-            let bytes = self.reader.read_u8()?;
-
-            println!("special: {}",bytes);
-
-           
-            let layer = (((bytes & 0xf0) >> 4) as i8) - 5;
-
-            let num_tags = bytes & 0x0f;
-
-            let mut tags: Vec<String> = vec![];
-
+            let mut tags: Vec<String> = Vec::with_capacity(num_tags as usize);
             for _ in 0..num_tags {
                 let tag_id = MapHeader::read_vbe_u_int(&mut self.reader)?;
-
-                if tag_id < self.header.poi_tags.len() as u32 {
+                if (tag_id as usize) < poi_tags_len {
                     tags.push(self.header.poi_tags[tag_id as usize].clone());
                 }
             }
 
-            let flag_bytes = self.reader.read_u8()?;
+            let flags = self.reader.read_u8()?;
+            let has_name = (flags & 0x80) != 0;
+            let has_house_number = (flags & 0x40) != 0;
+            let has_elevation = (flags & 0x20) != 0;
 
-            let has_name = flag_bytes & 0x01 != 0;
-
-            let has_house_number = flag_bytes & 0x02 != 0;
-
-            let has_elevation = flag_bytes & 0x04 != 0;
-
-            let poi_name: Option<String>;
-
-            if has_name {
-                poi_name = None;
+            let name = if has_name {
+                Some(MapHeader::read_vbe_u(&mut self.reader)?)
             } else {
-                poi_name = None
-            }
+                None
+            };
 
-            let house_number: Option<String>;
-
-            if has_house_number {
-                house_number = None;
+            let house_number = if has_house_number {
+                Some(MapHeader::read_vbe_u(&mut self.reader)?)
             } else {
-                house_number = None
-            }
+                None
+            };
 
-            let elevation: Option<i32>;
-
-            if has_elevation {
-                elevation = Some(MapHeader::read_vbe_u_int(&mut self.reader)? as i32);
+            let elevation = if has_elevation {
+                Some(MapHeader::read_vbe_s_int(&mut self.reader)?)
             } else {
-                elevation = None
+                None
+            };
+
+            if i < 5 {
+                println!(
+                    "DEBUG POI {}: lat_diff={}, lon_diff={}, layer={}, tags={:?}, name={:?}",
+                    i, lat_diff, lon_diff, layer, tags, name
+                );
             }
 
             poi_data.push(POI {
-                position_offset: (lat, lon),
-                layer: layer as i8,
+                position_offset: (lat_diff as f64, lon_diff as f64),
+                layer,
                 tag: tags,
                 elevation,
                 house_number,
-                name: poi_name,
+                name,
             });
         }
+
+        println!("DEBUG: Successfully parsed {} POIs", poi_data.len());
+
+        // Now seek to where ways actually start
+        println!(
+            "DEBUG: Current position after POIs = {}",
+            self.reader.stream_position()?
+        );
+        println!(
+            "DEBUG: Seeking to ways_absolute_position = {}",
+            ways_absolute_position
+        );
+        self.reader.seek(SeekFrom::Start(ways_absolute_position))?;
+
+        // Parse ways
+        let ways = self.parse_ways(&zoom_table, current_zoom_index)?;
 
         Ok(Tile {
             first_way_offset,
             zoom_table,
             pois: poi_data,
+            ways,
         })
     }
 
+    pub fn parse_ways(
+        &mut self,
+        zoom_table: &[(u32, u32)],
+        current_zoom_index: usize,
+    ) -> Result<Vec<Way>> {
+        let way_count = zoom_table[current_zoom_index].1;
+
+        println!("DEBUG: Parsing {} ways", way_count);
+
+        if way_count > 100000 {
+            return Err(MapforgeError::InvalidTileData);
+        }
+
+        let mut ways: Vec<Way> = Vec::with_capacity(way_count as usize);
+
+        for i in 0..way_count {
+            // Debug signature (32 bytes if debug flag set)
+            if self.header.flags & DEBUG_INFO_MASK != 0 {
+                let mut bytes = [0u8; 32];
+                self.reader.read_exact(&mut bytes)?;
+                let sig = String::from_utf8_lossy(&bytes);
+
+                if !sig.starts_with("---WayStart") {
+                    println!(
+                        "ERROR: Invalid Way signature at index {}: '{}'",
+                        i,
+                        sig.trim()
+                    );
+                    return Err(MapforgeError::InvalidWaySignature);
+                }
+            }
+
+            // Way data size (VBE-U INT) - IMPORTANT: we can use this to skip if parsing fails
+            let way_data_size = MapHeader::read_vbe_u_int(&mut self.reader)?;
+            let way_start_pos = self.reader.stream_position()?;
+
+            // Sub tile bitmap (2 bytes)
+            let sub_tile_bitmap = self.reader.read_u16::<BigEndian>()?;
+
+            // Special byte
+            let special_byte = self.reader.read_u8()?;
+            let layer = (((special_byte & 0xf0) >> 4) as i8) - 5;
+            let num_tags = (special_byte & 0x0f) as u32;
+
+            // Tag IDs
+            let mut tag_ids: Vec<u32> = Vec::with_capacity(num_tags as usize);
+            for _ in 0..num_tags {
+                let tag_id = MapHeader::read_vbe_u_int(&mut self.reader)?;
+                tag_ids.push(tag_id);
+            }
+
+            // Flags byte
+            let flags = self.reader.read_u8()?;
+            let has_name = (flags & 0x80) != 0;
+            let has_house_number = (flags & 0x40) != 0;
+            let has_ref = (flags & 0x20) != 0;
+            let has_label_position = (flags & 0x10) != 0;
+            let has_num_way_blocks = (flags & 0x08) != 0;
+            let double_delta_encoding = (flags & 0x04) != 0;
+
+            // Optional fields
+            let name = if has_name {
+                Some(MapHeader::read_vbe_u(&mut self.reader)?)
+            } else {
+                None
+            };
+
+            let house_number = if has_house_number {
+                Some(MapHeader::read_vbe_u(&mut self.reader)?)
+            } else {
+                None
+            };
+
+            let reference = if has_ref {
+                Some(MapHeader::read_vbe_u(&mut self.reader)?)
+            } else {
+                None
+            };
+
+            let label_position = if has_label_position {
+                let lat_diff = MapHeader::read_vbe_s_int(&mut self.reader)?;
+                let lon_diff = MapHeader::read_vbe_s_int(&mut self.reader)?;
+                Some((lat_diff, lon_diff))
+            } else {
+                None
+            };
+
+            // Number of way data blocks (only if flag is set, otherwise 1)
+            let num_way_blocks = if has_num_way_blocks {
+                MapHeader::read_vbe_u_int(&mut self.reader)?
+            } else {
+                1
+            };
+
+            // Parse coordinate blocks
+            let mut coordinate_blocks: Vec<WayCoordinateBlock> = Vec::new();
+
+            for _block in 0..num_way_blocks {
+                // Number of way coordinate blocks (multipolygon: first=outer, rest=inner)
+                let num_coord_blocks = MapHeader::read_vbe_u_int(&mut self.reader)?;
+
+                for _coord_block in 0..num_coord_blocks {
+                    // Number of way nodes
+                    let num_nodes = MapHeader::read_vbe_u_int(&mut self.reader)?;
+
+                    if num_nodes == 0 {
+                        continue;
+                    }
+
+                    // First coordinate (offset from tile corner)
+                    let first_lat = MapHeader::read_vbe_s_int(&mut self.reader)?;
+                    let first_lon = MapHeader::read_vbe_s_int(&mut self.reader)?;
+
+                    let mut coordinates: Vec<(i32, i32)> = Vec::with_capacity(num_nodes as usize);
+                    coordinates.push((first_lat, first_lon));
+
+                    if double_delta_encoding {
+                        // Double delta decoding
+                        let mut prev_lat_delta = 0i32;
+                        let mut prev_lon_delta = 0i32;
+                        let mut current_lat = first_lat;
+                        let mut current_lon = first_lon;
+
+                        for _ in 1..num_nodes {
+                            let lat_delta_delta = MapHeader::read_vbe_s_int(&mut self.reader)?;
+                            let lon_delta_delta = MapHeader::read_vbe_s_int(&mut self.reader)?;
+
+                            prev_lat_delta += lat_delta_delta;
+                            prev_lon_delta += lon_delta_delta;
+
+                            current_lat += prev_lat_delta;
+                            current_lon += prev_lon_delta;
+
+                            coordinates.push((current_lat, current_lon));
+                        }
+                    } else {
+                        // Single delta decoding
+                        let mut current_lat = first_lat;
+                        let mut current_lon = first_lon;
+
+                        for _ in 1..num_nodes {
+                            let lat_delta = MapHeader::read_vbe_s_int(&mut self.reader)?;
+                            let lon_delta = MapHeader::read_vbe_s_int(&mut self.reader)?;
+
+                            current_lat += lat_delta;
+                            current_lon += lon_delta;
+
+                            coordinates.push((current_lat, current_lon));
+                        }
+                    }
+
+                    coordinate_blocks.push(WayCoordinateBlock {
+                        initial_position: (first_lat, first_lon),
+                        coordinates,
+                    });
+                }
+            }
+
+            // Verify we read exactly way_data_size bytes
+            let way_end_pos = self.reader.stream_position()?;
+            let bytes_read = way_end_pos - way_start_pos;
+
+            if bytes_read != way_data_size as u64 {
+                println!(
+                    "WARNING Way {}: expected {} bytes, read {} bytes",
+                    i, way_data_size, bytes_read
+                );
+                // Skip to correct position
+                let correct_pos = way_start_pos + way_data_size as u64;
+                self.reader.seek(SeekFrom::Start(correct_pos))?;
+            }
+
+            if i < 3 {
+                println!(
+                    "DEBUG Way {}: layer={}, tags={:?}, name={:?}, blocks={}, size={}",
+                    i,
+                    layer,
+                    tag_ids,
+                    name,
+                    coordinate_blocks.len(),
+                    way_data_size
+                );
+            }
+
+            ways.push(Way {
+                sub_tile_bitmap,
+                layer,
+                tag_ids,
+                name,
+                house_number,
+                reference,
+                label_position,
+                coordinate_blocks,
+                double_delta_encoding,
+            });
+        }
+
+        println!("DEBUG: Successfully parsed {} ways", ways.len());
+
+        Ok(ways)
+    }
     fn calculate_tile_entry(&mut self, lat: f64, lon: f64, zoom: u8) -> Result<&TileIndexEntry> {
         let zoom_level_index = self
             .header
             .zoom_interval_configuration
             .iter()
             .position(|interval| zoom >= interval.min_zoom_level && zoom <= interval.max_zoom_level)
-            .unwrap();
+            .ok_or(MapforgeError::ZoomLevelNotSupported)?;
 
         let tiles_for_zoom = &self.tile_indices[zoom_level_index];
 
@@ -280,5 +519,20 @@ impl MapFile {
         let total = num_x * num_y;
 
         total
+    }
+
+    pub fn get_way_tags(&self, way: &Way) -> Vec<String> {
+        way.tag_ids
+            .iter()
+            .filter_map(|&id| self.header.way_tags.get(id as usize).cloned())
+            .collect()
+    }
+}
+
+impl Tile {
+    pub fn get_absolute_poi_position(&self, poi: &POI, tile_lat: f64, tile_lon: f64) -> (f64, f64) {
+        let lat = tile_lat + (poi.position_offset.0 / 1_000_000.0);
+        let lon = tile_lon + (poi.position_offset.1 / 1_000_000.0);
+        (lat, lon)
     }
 }

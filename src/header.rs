@@ -101,7 +101,7 @@ impl MapHeader {
             let lat = reader.read_i32::<BigEndian>()? as f64 / 1_000_000.0;
             let lon = reader.read_i32::<BigEndian>()? as f64 / 1_000_000.0;
             map_start_position = Some((lat, lon));
-        }else{ 
+        } else {
             map_start_position = None
         }
 
@@ -124,17 +124,16 @@ impl MapHeader {
         let comment: Option<String>;
         if flags & COMMENT_MASK != 0 {
             comment = Some(Self::read_vbe_u(reader)?)
-        }else {
+        } else {
             comment = None
         }
 
         let created_by: Option<String>;
         if flags & CREATED_BY_MASK != 0 {
             created_by = Some(Self::read_vbe_u(reader)?);
-        }else{
+        } else {
             created_by = None
         }
-
 
         let num_poi_tags = reader.read_u16::<BigEndian>()?;
         let mut poi_tags: Vec<String> = vec![];
@@ -152,10 +151,8 @@ impl MapHeader {
             way_tags.push(tag);
         }
 
-
         let num_zoom_intervals = reader.read_u8()?;
-        let mut zoom_interval_configuration:Vec<ZoomInterval> = vec![];
-
+        let mut zoom_interval_configuration: Vec<ZoomInterval> = vec![];
 
         for _ in 0..num_zoom_intervals {
             let base_zoom_level = reader.read_u8()?;
@@ -164,20 +161,14 @@ impl MapHeader {
             let sub_file_start = reader.read_u64::<BigEndian>()?;
             let sub_file_size = reader.read_u64::<BigEndian>()?;
 
-
-            
-
-            zoom_interval_configuration.push(ZoomInterval{
+            zoom_interval_configuration.push(ZoomInterval {
                 base_zoom_level,
                 max_zoom_level,
                 min_zoom_level,
                 sub_file_size,
-                sub_file_start
+                sub_file_start,
             });
-
-
         }
-
 
         let header = MapHeader {
             magic,
@@ -197,8 +188,7 @@ impl MapHeader {
             poi_tags,
             way_tags,
             num_zoom_intervals,
-            zoom_interval_configuration
-
+            zoom_interval_configuration,
         };
 
         if !header.is_valid() {
@@ -232,8 +222,7 @@ impl MapHeader {
         Ok(String::from_utf8(string_bytes).expect("Error parsing vbe_u"))
     }
 
-    pub(crate) fn read_vbe_u_int<R: Read>(reader: &mut BufReader<R>) -> Result<u32> {
-
+    pub fn read_vbe_u_int<R: Read>(reader: &mut BufReader<R>) -> Result<u32> {
         let mut value = 0u32;
 
         let mut shift = 0;
@@ -249,37 +238,35 @@ impl MapHeader {
 
             shift += 7
         }
-        
 
         Ok(value)
+    }
 
-     }
-
-     pub fn read_vbe_s_int<R: Read>(reader: &mut BufReader<R>) -> Result<i32> {
+    pub fn read_vbe_s_int<R: Read>(reader: &mut BufReader<R>) -> Result<i32> {
         let mut value = 0i32;
         let mut shift = 0;
-    
+
         // Read bytes until we find one with continuation bit = 0
         loop {
             let byte = reader.read_u8()?;
-            
+
             // Last byte
             if byte & 0x80 == 0 {
                 // Last byte uses 6 bits for data and 1 bit for sign
                 let is_negative = (byte & 0x40) != 0;
                 value |= ((byte & 0x3f) as i32) << shift;
-                
+
                 if is_negative {
                     value = -value;
                 }
                 break;
             }
-    
+
             // Use 7 bits from continuation bytes
             value |= ((byte & 0x7f) as i32) << shift;
             shift += 7;
         }
-    
+
         Ok(value)
     }
     pub fn is_valid(&self) -> bool {
