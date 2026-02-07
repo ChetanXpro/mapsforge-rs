@@ -1,5 +1,5 @@
 
-use mapsforge_rs::types::MapFile;
+use gps::types::MapFile;
 
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -7,11 +7,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     
     // println!("Header: {:#?}", map.tile_indices);
 
-    let lat = 28.6139; 
-    let lon = 77.2090;
-    let zoom = 14;
+    let center_lat = 23.2599;
+let center_lon = 77.4126;
 
-    let tile = map.get_tile_at(lat, lon, zoom)?;
+    let zoom = 15;
+
+    let tile = map.get_tile_at(center_lat, center_lon, zoom)?;
 
     println!("{:#?}",tile);
     

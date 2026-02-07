@@ -74,6 +74,7 @@ impl MapFile {
     }
 
     pub fn get_tile_at(&mut self, lat: f64, lon: f64, zoom: u8) -> Result<Tile> {
+      
         let zoom_level_index = self
             .header
             .zoom_interval_configuration
@@ -91,7 +92,6 @@ impl MapFile {
 
         let absolute_offset = zoom_interval_start + tile_offset;
 
-      
         self.reader.seek(SeekFrom::Start(absolute_offset))?;
 
         // TILE HEADER - Debug signature
@@ -178,8 +178,27 @@ impl MapFile {
             let mut tags: Vec<String> = Vec::with_capacity(num_tags as usize);
             for _ in 0..num_tags {
                 let tag_id = MapHeader::read_vbe_u_int(&mut self.reader)?;
+
                 if (tag_id as usize) < poi_tags_len {
-                    tags.push(self.header.poi_tags[tag_id as usize].clone());
+                    let tag_name = &self.header.poi_tags[tag_id as usize];
+
+                    // Check if this tag has a wildcard value (version 5+)
+                    if self.header.file_version >= 5 && self.header.tag_has_wildcard(tag_name) {
+                        // Read the variable value
+                        let value = MapHeader::read_vbe_u(&mut self.reader)?;
+                        // Replace * with actual value: "name=*" → "name=Restaurant"
+                        let tag_with_value = tag_name.replace('*', &value);
+                        tags.push(tag_with_value);
+                    } else {
+                        // No wildcard, just use tag name
+                        tags.push(tag_name.clone());
+                    }
+                } else if self.header.file_version >= 5 {
+                    // Invalid tag ID in v5 - might still have a value to skip
+                    // This is defensive: skip the value if it exists
+                    // We can't know for sure, so this might cause issues
+                    // Better to validate tag_id is valid
+                    return Err(MapforgeError::InvalidTagId);
                 }
             }
 
@@ -214,7 +233,7 @@ impl MapFile {
             }
 
             poi_data.push(POI {
-                position_offset: (lat_diff as f64, lon_diff as f64),
+                position_offset: (lat_diff, lon_diff),
                 layer,
                 tag: tags,
                 elevation,
@@ -237,7 +256,9 @@ impl MapFile {
         self.reader.seek(SeekFrom::Start(ways_absolute_position))?;
 
         // Parse ways
-        let ways = self.parse_ways(&zoom_table, current_zoom_index)?;
+        let way_count = zoom_table[current_zoom_index].1;
+
+        let ways = self.parse_ways_count(way_count)?;
 
         Ok(Tile {
             first_way_offset,
@@ -247,13 +268,7 @@ impl MapFile {
         })
     }
 
-    pub fn parse_ways(
-        &mut self,
-        zoom_table: &[(u32, u32)],
-        current_zoom_index: usize,
-    ) -> Result<Vec<Way>> {
-        let way_count = zoom_table[current_zoom_index].1;
-
+    pub fn parse_ways_count(&mut self, way_count: u32) -> Result<Vec<Way>> {
         println!("DEBUG: Parsing {} ways", way_count);
 
         if way_count > 100000 {
@@ -292,10 +307,26 @@ impl MapFile {
             let num_tags = (special_byte & 0x0f) as u32;
 
             // Tag IDs
+            // Tag IDs
             let mut tag_ids: Vec<u32> = Vec::with_capacity(num_tags as usize);
             for _ in 0..num_tags {
                 let tag_id = MapHeader::read_vbe_u_int(&mut self.reader)?;
+
+                // Validate tag ID is within bounds
+                if tag_id as usize >= self.header.way_tags.len() {
+                    return Err(MapforgeError::InvalidTagId);
+                }
+
                 tag_ids.push(tag_id);
+
+                // For version 5+, check if tag has wildcard and read value
+                if self.header.file_version >= 5 {
+                    let tag_name = &self.header.way_tags[tag_id as usize];
+                    if self.header.tag_has_wildcard(tag_name) {
+                        // Read and discard the value
+                        let _value = MapHeader::read_vbe_u(&mut self.reader)?;
+                    }
+                }
             }
 
             // Flags byte
@@ -335,7 +366,7 @@ impl MapFile {
             };
 
             // Number of way data blocks (only if flag is set, otherwise 1)
-            let num_way_blocks = if has_num_way_blocks {
+            let num_way_data_blocks = if has_num_way_blocks {
                 MapHeader::read_vbe_u_int(&mut self.reader)?
             } else {
                 1
@@ -344,19 +375,30 @@ impl MapFile {
             // Parse coordinate blocks
             let mut coordinate_blocks: Vec<WayCoordinateBlock> = Vec::new();
 
-            for _block in 0..num_way_blocks {
-                // Number of way coordinate blocks (multipolygon: first=outer, rest=inner)
+            // For each way data block
+            for _data_block in 0..num_way_data_blocks {
+                // Read number of coordinate blocks for this data block
                 let num_coord_blocks = MapHeader::read_vbe_u_int(&mut self.reader)?;
 
+                if num_coord_blocks == 0 || num_coord_blocks > 100 {
+                    println!(
+                        "WARNING Way {}: suspicious num_coord_blocks = {}",
+                        i, num_coord_blocks
+                    );
+                }
+
                 for _coord_block in 0..num_coord_blocks {
-                    // Number of way nodes
                     let num_nodes = MapHeader::read_vbe_u_int(&mut self.reader)?;
 
                     if num_nodes == 0 {
                         continue;
                     }
 
-                    // First coordinate (offset from tile corner)
+                    if num_nodes > 10000 {
+                        println!("  ERROR: num_nodes {} is suspiciously large!", num_nodes);
+                        return Err(MapforgeError::InvalidTileData);
+                    }
+
                     let first_lat = MapHeader::read_vbe_s_int(&mut self.reader)?;
                     let first_lon = MapHeader::read_vbe_s_int(&mut self.reader)?;
 
@@ -365,22 +407,33 @@ impl MapFile {
 
                     if double_delta_encoding {
                         // Double delta decoding
-                        let mut prev_lat_delta = 0i32;
-                        let mut prev_lon_delta = 0i32;
-                        let mut current_lat = first_lat;
-                        let mut current_lon = first_lon;
+                        let mut previous_lat = first_lat;
+                        let mut previous_lon = first_lon;
+                        let mut previous_lat_offset = 0i32;
+                        let mut previous_lon_offset = 0i32;
+                        let mut count = 0;
 
                         for _ in 1..num_nodes {
-                            let lat_delta_delta = MapHeader::read_vbe_s_int(&mut self.reader)?;
-                            let lon_delta_delta = MapHeader::read_vbe_s_int(&mut self.reader)?;
+                            let lat_encoded = MapHeader::read_vbe_s_int(&mut self.reader)?;
+                            let lon_encoded = MapHeader::read_vbe_s_int(&mut self.reader)?;
 
-                            prev_lat_delta += lat_delta_delta;
-                            prev_lon_delta += lon_delta_delta;
+                            let current_lat = previous_lat
+                                .saturating_add(previous_lat_offset)
+                                .saturating_add(lat_encoded);
+                            let current_lon = previous_lon
+                                .saturating_add(previous_lon_offset)
+                                .saturating_add(lon_encoded);
 
-                            current_lat += prev_lat_delta;
-                            current_lon += prev_lon_delta;
+                            if count > 0 {
+                                previous_lat_offset = current_lat.saturating_sub(previous_lat);
+                                previous_lon_offset = current_lon.saturating_sub(previous_lon);
+                            }
+
+                            previous_lat = current_lat;
+                            previous_lon = current_lon;
 
                             coordinates.push((current_lat, current_lon));
+                            count += 1;
                         }
                     } else {
                         // Single delta decoding
@@ -391,8 +444,8 @@ impl MapFile {
                             let lat_delta = MapHeader::read_vbe_s_int(&mut self.reader)?;
                             let lon_delta = MapHeader::read_vbe_s_int(&mut self.reader)?;
 
-                            current_lat += lat_delta;
-                            current_lon += lon_delta;
+                            current_lat = current_lat.saturating_add(lat_delta);
+                            current_lon = current_lon.saturating_add(lon_delta);
 
                             coordinates.push((current_lat, current_lon));
                         }
@@ -410,13 +463,8 @@ impl MapFile {
             let bytes_read = way_end_pos - way_start_pos;
 
             if bytes_read != way_data_size as u64 {
-                println!(
-                    "WARNING Way {}: expected {} bytes, read {} bytes",
-                    i, way_data_size, bytes_read
-                );
-                // Skip to correct position
-                let correct_pos = way_start_pos + way_data_size as u64;
-                self.reader.seek(SeekFrom::Start(correct_pos))?;
+                // Data size mismatch indicates parser is out of sync - fail hard
+                return Err(MapforgeError::InvalidTileData);
             }
 
             if i < 3 {
@@ -448,6 +496,7 @@ impl MapFile {
 
         Ok(ways)
     }
+
     fn calculate_tile_entry(&mut self, lat: f64, lon: f64, zoom: u8) -> Result<&TileIndexEntry> {
         let zoom_level_index = self
             .header
@@ -456,18 +505,23 @@ impl MapFile {
             .position(|interval| zoom >= interval.min_zoom_level && zoom <= interval.max_zoom_level)
             .ok_or(MapforgeError::ZoomLevelNotSupported)?;
 
+        let interval = &self.header.zoom_interval_configuration[zoom_level_index];
+        let base_zoom = interval.base_zoom_level;
+
         let tiles_for_zoom = &self.tile_indices[zoom_level_index];
 
-        let (x, y) = Self::get_tile_coordinates(lat, lon, zoom);
+        let (x, y) = Self::get_tile_coordinates(lat, lon, base_zoom);
 
-        let x_min = ((self.header.bounding_box.min_lon + 180.0) / 360.0 * 2_f64.powi(zoom as i32))
-            .floor() as i64;
-        let x_max = ((self.header.bounding_box.max_lon + 180.0) / 360.0 * 2_f64.powi(zoom as i32))
-            .floor() as i64;
+        let x_min = ((self.header.bounding_box.min_lon + 180.0) / 360.0
+            * 2_f64.powi(base_zoom as i32))
+        .floor() as i64;
+        let x_max = ((self.header.bounding_box.max_lon + 180.0) / 360.0
+            * 2_f64.powi(base_zoom as i32))
+        .floor() as i64;
 
         let lat_rad_max = self.header.bounding_box.max_lat.to_radians();
         let y_min = ((1.0 - (lat_rad_max.tan() + 1.0 / lat_rad_max.cos()).ln() / PI) / 2.0
-            * 2_f64.powi(zoom as i32))
+            * 2_f64.powi(base_zoom as i32))
         .floor() as i64;
 
         let grid_width = x_max - x_min + 1;
@@ -531,8 +585,35 @@ impl MapFile {
 
 impl Tile {
     pub fn get_absolute_poi_position(&self, poi: &POI, tile_lat: f64, tile_lon: f64) -> (f64, f64) {
-        let lat = tile_lat + (poi.position_offset.0 / 1_000_000.0);
-        let lon = tile_lon + (poi.position_offset.1 / 1_000_000.0);
+        let lat = tile_lat + (poi.position_offset.0 as f64 / 1_000_000.0);
+        let lon = tile_lon + (poi.position_offset.1 as f64 / 1_000_000.0);
         (lat, lon)
+    }
+}
+
+// In your mapsforge-rs library
+impl MapFile {
+    pub fn get_tile_origin(&self, lat: f64, lon: f64, zoom: u8) -> Option<(f64, f64)> {
+        let interval = self
+            .header
+            .zoom_interval_configuration
+            .iter()
+            .find(|i| zoom >= i.min_zoom_level && zoom <= i.max_zoom_level)?;
+
+        let base_zoom = interval.base_zoom_level;
+        let n = 2_f64.powi(base_zoom as i32);
+
+        let tile_x = ((lon + 180.0) / 360.0 * n).floor() as u32;
+        let tile_y = ((1.0
+            - (lat.to_radians().tan() + 1.0 / lat.to_radians().cos()).ln() / std::f64::consts::PI)
+            / 2.0
+            * n)
+            .floor() as u32;
+
+        let tile_lon_min = (tile_x as f64 / n) * 360.0 - 180.0;
+        let tile_lat_max_rad = std::f64::consts::PI * (1.0 - 2.0 * tile_y as f64 / n);
+        let tile_lat_max = tile_lat_max_rad.sinh().atan().to_degrees();
+
+        Some((tile_lat_max, tile_lon_min))
     }
 }

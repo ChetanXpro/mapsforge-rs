@@ -198,13 +198,17 @@ impl MapHeader {
         Ok(header)
     }
 
-    pub(crate) fn read_vbe_u<R: Read>(reader: &mut BufReader<R>) -> Result<String> {
+    pub fn read_vbe_u<R: Read>(reader: &mut BufReader<R>) -> Result<String> {
         let mut length = 0u32;
-
         let mut shift = 0;
 
         loop {
             let byte = reader.read_u8()?;
+
+            // Prevent overflow
+            if shift >= 32 {
+                return Err(MapforgeError::InvalidVbeEncoding);
+            }
 
             length |= ((byte & 0x7F) as u32) << shift;
 
@@ -212,14 +216,14 @@ impl MapHeader {
                 break;
             }
 
-            shift += 7
+            shift += 7;
         }
 
         let mut string_bytes = vec![0u8; length as usize];
-
         reader.read_exact(&mut string_bytes)?;
 
-        Ok(String::from_utf8(string_bytes).expect("Error parsing vbe_u"))
+        // Proper error handling instead of panic
+        String::from_utf8(string_bytes).map_err(|_| MapforgeError::InvalidUtf8)
     }
 
     pub fn read_vbe_u_int<R: Read>(reader: &mut BufReader<R>) -> Result<u32> {
@@ -246,15 +250,23 @@ impl MapHeader {
         let mut value = 0i32;
         let mut shift = 0;
 
-        // Read bytes until we find one with continuation bit = 0
         loop {
             let byte = reader.read_u8()?;
 
-            // Last byte
+            // Last byte (continuation bit is 0)
             if byte & 0x80 == 0 {
-                // Last byte uses 6 bits for data and 1 bit for sign
                 let is_negative = (byte & 0x40) != 0;
-                value |= ((byte & 0x3f) as i32) << shift;
+
+                // Extract 6 bits from last byte
+                let last_bits = (byte & 0x3f) as i32;
+
+                // Check for overflow before shifting
+                if shift < 26 {
+                    // 32 - 6 = 26
+                    value |= last_bits << shift;
+                } else if last_bits != 0 {
+                    return Err(MapforgeError::InvalidVbeEncoding);
+                }
 
                 if is_negative {
                     value = -value;
@@ -262,16 +274,29 @@ impl MapHeader {
                 break;
             }
 
-            // Use 7 bits from continuation bytes
-            value |= ((byte & 0x7f) as i32) << shift;
+            // Continuation byte - use 7 bits
+            if shift < 25 {
+                // Leave room for final 6 bits (32 - 7 = 25)
+                value |= ((byte & 0x7f) as i32) << shift;
+            } else {
+                return Err(MapforgeError::InvalidVbeEncoding);
+            }
+
             shift += 7;
         }
 
         Ok(value)
     }
+
     pub fn is_valid(&self) -> bool {
         self.magic.trim() == MAGIC_BYTES
             && self.header_size > 0
             && self.file_version >= MIN_SUPPORTED_VERSION
+    }
+}
+
+impl MapHeader {
+    pub fn tag_has_wildcard(&self, tag: &str) -> bool {
+        tag.contains('=') && tag.ends_with('*')
     }
 }

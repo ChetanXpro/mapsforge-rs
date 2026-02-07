@@ -15,6 +15,12 @@ pub enum MapforgeError {
     #[error("Invalid bounding box values")]
     InvalidBoundingBox,
 
+    #[error("Invalid vbe encoding")]
+    InvalidVbeEncoding,
+
+    #[error("Invalid tag id")]
+    InvalidTagId,
+
     #[error("Invalid header size: {0}")]
     InvalidHeaderSize(u32),
 
@@ -33,11 +39,17 @@ pub enum MapforgeError {
     #[error("Tile out of bound")]
     TileOutOfBounds,
 
+    #[error("Invalid UTF-8 string")]
+    InvalidUtf8,
+
     #[error("Invalid way signature")]
     InvalidWaySignature,
 
     #[error("Zoom level not supported")]
     ZoomLevelNotSupported,
+
+    #[error("Unsupported file version: {0}, expected version 3 or higher")]
+    UnsupportedFileVersion(String),
 
     #[error("Errrrrr")]
     InvalidVBEInteger,

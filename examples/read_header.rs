@@ -1,6 +1,6 @@
 use std::fs::File;
 use std::io::BufReader;
-use mapsforge_rs::MapHeader;
+use gps::MapHeader;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let file = File::open("sample/central-zone.map")?;

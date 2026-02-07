@@ -74,7 +74,7 @@ pub struct Tile {
 
 #[derive(Debug)]
 pub struct POI {
-    pub position_offset: (f64, f64),
+    pub position_offset: (i32, i32),
     pub layer: i8,
     pub tag: Vec<String>,
     pub name: Option<String>,

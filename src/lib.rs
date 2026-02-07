@@ -1,6 +1,8 @@
 pub mod error;
 pub mod header;
 pub mod tile;
+pub mod coordinate;
+pub mod renderer;
 pub mod types;
 pub mod utils;
 
@@ -12,6 +14,7 @@ pub mod prelude {
     pub use crate::types::{BoundingBox, MapHeader};
     pub use crate::Result;
 }
+
 
 
 pub type Result<T> = std::result::Result<T, MapforgeError>;
