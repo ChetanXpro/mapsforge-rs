@@ -1,4 +1,4 @@
-# mapsforge-rs (WIP)
+# mapsforge-rs
 
 A Rust parser for Mapsforge binary map files. This library provides functionality to read and parse Mapsforge map files (.map), which are commonly used for offline mapping applications.
 
@@ -8,9 +8,9 @@ A Rust parser for Mapsforge binary map files. This library provides functionalit
   - Magic bytes validation
   - Version checking
   - Bounding box parsing
-- [ ] Map tile parsing (Coming soon)
-- [ ] POI data structure (Coming soon)
-- [ ] Sub-file structure parsing (Coming soon)
+- [x] Map tile parsing
+- [x] POI data structure
+- [x] Sub-file structure parsing 
 
 ## Installation
 
